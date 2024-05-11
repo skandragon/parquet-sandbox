@@ -2,11 +2,12 @@ package main
 
 import (
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
-	"runtime"
+	"strings"
 
 	"github.com/parquet-go/parquet-go"
 )
@@ -17,49 +18,63 @@ import (
 // in memory at once, so long as the writer does not hold on to too many unwritten records.
 //
 
+var (
+	sourcedir     = flag.String("sourcedir", "", "directory containing parquet files to merge")
+	outfile       = flag.String("outfile", "", "output file to write merged records to")
+	requireFields = flag.String("requireFields", "", "comma separated list of fields that must be present in a file to merge")
+)
+
 func main() {
-	PrintMemUsage()
-	merge()
-	PrintMemUsage()
-}
+	flag.Parse()
 
-// PrintMemUsage outputs the current, total and OS memory being used. As well as the number
-// of garage collection cycles completed.
-func PrintMemUsage() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	fmt.Printf("Alloc = %v MiB", bToMb(m.Alloc))
-	fmt.Printf("\tTotalAlloc = %v MiB", bToMb(m.TotalAlloc))
-	fmt.Printf("\tSys = %v MiB", bToMb(m.Sys))
-	fmt.Printf("\tNumGC = %v\n", m.NumGC)
-}
-
-func bToMb(b uint64) uint64 {
-	return b / 1024 / 1024
-}
-
-func merge() {
-	files := []string{
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317740000_191656998.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317740000_806476119.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317750000_589053731.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317750000_817577671.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317760000_385929257.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317760000_494377519.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317770000_448974791.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317770000_824349254.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317780000_253101403.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317780000_545395187.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317790000_273852496.parquet",
-		"/Users/mgraff/Downloads/otel-raw-year=2024-month=05-day=10-hour=05-minute=09-metrics_1715317790000_732180120.parquet",
+	if *sourcedir == "" {
+		log.Fatal("sourcedir is required")
 	}
 
+	if *outfile == "" {
+		*outfile = "merged.parquet"
+	}
+
+	rfields := strings.Split(*requireFields, ",")
+	files := findFiles(*sourcedir)
+
+	merge(*outfile, rfields, files)
+}
+
+func findFiles(dir string) []string {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var out []string
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		if strings.HasSuffix(file.Name(), ".parquet") {
+			out = append(out, dir+"/"+file.Name())
+		}
+	}
+	return out
+}
+
+func merge(outfile string, rfields, files []string) {
 	mergedSchema := map[string]parquet.Node{}
 	fileSchema := map[string]*parquet.Schema{}
 	for _, file := range files {
 		nodes, err := getSchemaNodes(file)
 		if err != nil {
 			log.Fatal(err)
+		}
+		keep := true
+		for _, field := range rfields {
+			if _, ok := nodes[field]; !ok {
+				keep = false
+				break
+			}
+		}
+		if !keep {
+			continue
 		}
 		fileSchema[file] = parquet.NewSchema(file, parquet.Group(nodes))
 		for k, v := range nodes {
@@ -74,7 +89,7 @@ func merge() {
 	}
 	schema := parquet.NewSchema("merged", parquet.Group(mergedSchema))
 
-	outf, err := os.Create("merged.parquet")
+	outf, err := os.Create(outfile)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -83,7 +98,7 @@ func merge() {
 		log.Fatalf("error creating writer config: %v", err)
 	}
 	writer := parquet.NewGenericWriter[map[string]any](outf, wc)
-	for _, file := range files {
+	for file := range fileSchema {
 		stat, err := os.Stat(file)
 		if err != nil {
 			log.Fatal(err)
@@ -165,7 +180,6 @@ func getSchemaNodes(fname string) (map[string]parquet.Node, error) {
 				return nil, fmt.Errorf("schema mismatch: %s", schema.Name)
 			}
 		} else {
-			log.Printf("file %s adds %s -> %s", fname, schema.Name, stype.String())
 			nodes[schema.Name] = stype
 		}
 	}
@@ -179,6 +193,11 @@ var (
 		"INT16":      parquet.Optional(parquet.Int(16)),
 		"INT32":      parquet.Optional(parquet.Int(32)),
 		"INT64":      parquet.Optional(parquet.Int(64)),
+		"UINT8":      parquet.Optional(parquet.Uint(8)),
+		"UINT16":     parquet.Optional(parquet.Uint(16)),
+		"UINT32":     parquet.Optional(parquet.Uint(32)),
+		"UINT64":     parquet.Optional(parquet.Uint(64)),
+		"FLOAT":      parquet.Optional(parquet.Leaf(parquet.FloatType)),
 		"DOUBLE":     parquet.Optional(parquet.Leaf(parquet.DoubleType)),
 		"BOOLEAN":    parquet.Optional(parquet.Leaf(parquet.BooleanType)),
 		"BYTE_ARRAY": parquet.Optional(parquet.Leaf(parquet.ByteArrayType)),
