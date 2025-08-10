@@ -107,8 +107,13 @@ func merge(outfile string, rfields, files []string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-		copyFromFile(inf, stat.Size(), writer, fileSchema[file])
-		inf.Close()
+		if err := copyFromFile(inf, stat.Size(), writer, fileSchema[file]); err != nil {
+			inf.Close()
+			log.Fatal(err)
+		}
+		if err := inf.Close(); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	if err := writer.Close(); err != nil {
